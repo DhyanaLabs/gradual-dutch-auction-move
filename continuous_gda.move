@@ -1,13 +1,12 @@
-/// Discrete GDAs are suitable for selling NFTs, because these have to be sold in integer quantities. They work by holding a virtual Dutch auction for each token being sold. These behave just like regular dutch auctions, with the ability for batches of auctions to be cleared efficiently.
-module nfts::discrete_gda {
+/// Continuous GDAs work by incrementally making more of an asset available for sale, at a constant emission rate, . For example, like we stated above, Alice might be interested in selling 0.25 tokens per minute. Emissions are broken up over an infinite series of virtual auctions. These auctions are started at an even rate over time, with each auction begining at the same price.
+module nfts::continuous_gda {
     use sui::coin::{Self, Coin};
     use sui::balance::Balance;
     use sui::sui::SUI;
     use sui::object::{Self, ID, UID};
     use sui::transfer;
     use sui::tx_context::{Self,TxContext};
-    use movemate::math;
-    
+
     #[test_only]
     use sui::test_scenario;
 
@@ -32,8 +31,8 @@ module nfts::discrete_gda {
         bid: Balance<SUI>
     }
 
-    /// Represents a discrete gradual dutch auction that is currently running.
-    struct DiscreteGDA has key {
+    /// Represents a continuous gradual dutch auction that is currently running.
+    struct ContinuousGDA has key {
         id: UID,
 
         /// Address of the bidder that is currently winning the auction.
@@ -45,57 +44,48 @@ module nfts::discrete_gda {
         /// Coin representing the current (highest) bid.
         funds: Balance<SUI>,
 
-        /// ID of the first token being sold in this auction. This is used to calculate the price of each token being sold and also to check if consecutive tokens are being purchased in a single bid.  If you want to purchase non-consecutive tokens in an auction then you need to submit multiple bids.
-        firstId: u64,
-
-        /// Number of tokens sold so far in this auction (i.e., currentId - firstId)
-        numSold: u64,
-
         /// parameter that controls initial price
         initialPrice: u64,
-
-        /// parameter that controls how much the starting price of each successive auction increases by
-        scaleFactor: i64,
 
         /// parameter that controls price decay
         decayConstant: u64,
 
-        /// start time for all auctions
-        auctionStartTime: u64
+        /// emission rate, in tokens per second
+        emissionRate: u64,
+
+        /// start time for last available auction
+        lastAvailableAuctionStartTime: u64
     }
 
     ///*///////////////////////////////////////////////////////////////
     //                         AUCTION LOGIC                         //
     /////////////////////////////////////////////////////////////////*/
 
-    /// Creates a new DiscreteGDA
-    public fun create_discrete_gda<T: key + store>(
-         numTokens: u64, initialPrice: u64, scaleFactor: i64, decayConstant: u64, auctionStartTime: u64
+    /// Creates a new ContinuousGDA
+    public fun create_continuous_gda<T: key + store>(
+         numTokens: u64, initialPrice: u64, decayConstant: u64, emissionRate: u64, lastAvailableAuctionStartTime: u64, ctx: &mut TxContext
     ) {
-        let auction = DiscreteGDA {
+        let auction = ContinuousGDA {
             id: object::new(ctx),
             highestBidder: 0,
             numTokens: numTokens,
             funds: coin::into_balance(coin::zero<SUI>(ctx)),
-            firstId: 0,
-            numSold: 0,
             initialPrice: initialPrice,
-            scaleFactor: scaleFactor,
             decayConstant: decayConstant,
-            auctionStartTime: auctionStartTime
+            emissionRate: emissionRate,
+            lastAvailableAuctionStartTime = lastAvailableAuctionStartTime; 
         };
-        
+
         share_object(auction);
     }
 
     /// Updates the auction based on the information in the bid (update auction if higher bid received and send coin back for bids that are too low). This is executed by the auctioneer.
     public entry fun update_auction<T: key + store>(
-        auction: &mut DiscreteGDA, bid: Bid, ctx: &mut TxContext
+        auction: &mut ContinuousGDA, bid: Bid, ctx: &mut TxContext
     ) {
         let Bid { id, bidder, auction_id, numTokens, bid: balance } = bid;
 
         assert!(object::borrow_id(auction) == &auction_id, EWrongAuction);
-        assert!(bid.numTokens > 0 && bid.numTokens + auction.firstId - 1 == auction.currentId);
 
         if (balance::value(&balance) >= balance::value(&auction.funds)) {
             // a bid higher than currently highest bid received
@@ -117,7 +107,7 @@ module nfts::discrete_gda {
     }
 
     public fun end_and_destroy_auction<T: key + store>(
-        auction: DiscreteGDA<T>, ctx: &mut TxContext
+        auction: ContinuousGDA<T>, ctx: &mut TxContext
     ) {
         let Auction { id, to_sell, owner, bid_data } = auction;
         object::delete(id);
@@ -143,17 +133,14 @@ module nfts::discrete_gda {
         transfer::transfer(bid, auctioneer);
     }
 
-    /// Calculate purchase price using exponential discrete GDA formula
-    fun purchasePrice(auction: DiscreteGDA, numTokens: u64, ctx: &mut TxContext): u64 {
+    /// Calculate purchase price using exponential continuous GDA formula
+    fun purchasePrice(auction: ContinuousGDA, numTokens: u64, ctx: &mut TxContext): u64 {
         quantity = numTokens;
-        numSold = auction.numSold;
-        timeSinceStart = tx_context::epoch(ctx) - auction.auctionStartTime;
-
-        num1 = auction.initialPrice * math::exp(auction.scaleFactor, numSold);
-        num2 = math::exp(auction.scaleFactor, quantity) - 1;
-        den1 = e_exp(auction.decayConstant * timeSinceStart);
-        den2 = auction.scaleFactor - 1;
-        totalCost = num1 * num2 / (den1 * den2);
+        timeSinceLastAuctionStart = tx_context::epoch(ctx) - auction.lastAvailableAuctionStartTime;
+        num1 = auction.initialPrice / auction.decayConstant;
+        num2 = e_exp(auction.decayConstant * quantity / auction.emissionRate) - 1;
+        den = e_exp(auction.decayConstant * timeSinceLastAuctionStart);
+        totalCost = num1 * num2 / den;
 
         return totalCost;
     }
@@ -164,19 +151,19 @@ module nfts::discrete_gda {
     }
 
     /// exposes transfer::transfer
-    public fun transfer<T: key + store>(obj: DiscreteGDA<T>, recipient: address) {
+    public fun transfer<T: key + store>(obj: ContinuousGDA<T>, recipient: address) {
         transfer::transfer(obj, recipient)
     }
 
     /// exposes transfer::transfer_to_object_id
     public fun transfer_to_object_id<T: key + store>(
-        obj: DiscreteGDA<T>,
+        obj: ContinuousGDA<T>,
         owner_id: &mut UID,
     ) {
         transfer::transfer_to_object_id(obj, owner_id)
     }
 
-    public fun share_object(obj: DiscreteGDA<T>) {
+    public fun share_object(obj: ContinuousGDA<T>) {
         transfer::share_object(obj)
     }
 
@@ -209,7 +196,7 @@ module nfts::discrete_gda {
 
         let coin = coin::mint_for_testing<SUI>(1000, ctx);
 
-        let auction = create_discrete_gda<SUI>(
+        let auction = create_continuous_gda<SUI>(
             3,
             1000,
             0.5,
